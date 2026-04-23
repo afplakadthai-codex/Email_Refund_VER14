@@ -361,6 +361,204 @@ if (!function_exists('bv_notify_queue_payload')) {
     }
 }
 
+if (!function_exists('bv_notify_money')) {
+    function bv_notify_money($amount): float
+    {
+        return round((float)$amount, 2);
+    }
+}
+
+if (!function_exists('bv_notify_money_format')) {
+    function bv_notify_money_format(float $amount, string $currency): string
+    {
+        return number_format(bv_notify_money($amount), 2) . ' ' . strtoupper(trim($currency) !== '' ? trim($currency) : 'USD');
+    }
+}
+
+if (!function_exists('bv_notify_pick_money')) {
+    function bv_notify_pick_money(array $row, array $keys, float $default = 0.0): float
+    {
+        foreach ($keys as $key) {
+            if (array_key_exists($key, $row) && $row[$key] !== null && $row[$key] !== '') {
+                return bv_notify_money($row[$key]);
+            }
+        }
+        return bv_notify_money($default);
+    }
+}
+
+if (!function_exists('bv_notify_build_seller_refund_email_payload')) {
+    function bv_notify_build_seller_refund_email_payload(string $eventKey, int $refundId, int $sellerId): ?array
+    {
+        if ($refundId <= 0 || $sellerId <= 0) {
+            return null;
+        }
+
+        $refund = bv_notify_query_one('SELECT * FROM order_refunds WHERE id = ? LIMIT 1', [$refundId]);
+        if (!$refund) {
+            return null;
+        }
+
+        $items = bv_notify_query_all(
+            'SELECT
+                ri.*, 
+                oi.id AS order_item_id,
+                oi.listing_id,
+                l.seller_id,
+                COALESCE(NULLIF(ri.item_title, ""), NULLIF(oi.item_title, ""), NULLIF(oi.title, ""), NULLIF(l.title, ""), CONCAT("Listing #", COALESCE(oi.listing_id, ri.order_item_id, ri.id))) AS listing_title
+             FROM order_refund_items ri
+             INNER JOIN order_items oi ON oi.id = ri.order_item_id
+             INNER JOIN listings l ON l.id = oi.listing_id
+             WHERE ri.refund_id = ?
+               AND l.seller_id = ?
+             ORDER BY ri.id ASC',
+            [$refundId, $sellerId]
+        );
+
+        if ($items === []) {
+            return null;
+        }
+
+        $currency = (string)($refund['currency'] ?? 'USD');
+        if (trim($currency) === '') {
+            $currency = 'USD';
+        }
+
+        $sellerRequestedAmount = 0.0;
+        $sellerApprovedAmount = 0.0;
+        $sellerFeeLoss = 0.0;
+        $sellerActualRefund = 0.0;
+        $normalizedItems = [];
+
+        foreach ($items as $item) {
+            $requestedAmount = bv_notify_money($item['requested_refund_amount'] ?? 0);
+            $approvedAmount = bv_notify_money($item['approved_refund_amount'] ?? 0);
+            $feeLoss = bv_notify_pick_money($item, ['allocated_fee_loss_amount', 'fee_loss_amount', 'non_refundable_fee_amount'], 0.0);
+            $actualRefund = bv_notify_pick_money($item, ['actual_refund_after_fee', 'actual_refund_amount', 'actual_refunded_amount', 'net_refund_amount'], $approvedAmount);
+
+            $sellerRequestedAmount += $requestedAmount;
+            $sellerApprovedAmount += $approvedAmount;
+            $sellerFeeLoss += $feeLoss;
+            $sellerActualRefund += $actualRefund;
+
+            $normalizedItems[] = [
+                'listing_title' => (string)($item['listing_title'] ?? ('Listing #' . (int)($item['listing_id'] ?? 0))),
+                'requested_amount' => bv_notify_money($requestedAmount),
+                'approved_amount' => bv_notify_money($approvedAmount),
+                'fee_loss' => bv_notify_money($feeLoss),
+                'actual_refund' => bv_notify_money($actualRefund),
+            ];
+        }
+
+        $sellerRequestedAmount = bv_notify_money($sellerRequestedAmount);
+        $sellerApprovedAmount = bv_notify_money($sellerApprovedAmount);
+        $sellerFeeLoss = bv_notify_money($sellerFeeLoss);
+        $sellerActualRefund = bv_notify_money($sellerActualRefund);
+
+        $refundCode = (int)($refund['id'] ?? $refundId);
+        $status = (string)($refund['status'] ?? 'pending');
+
+        $subjectPrefix = $eventKey === 'refund.completed' ? 'Refund Completed' : 'Refund Request';
+        $subject = $subjectPrefix . ' #' . $refundCode . ' (Seller Summary)';
+
+        $summaryLinesHtml = [
+            '<li><strong>Requested Amount:</strong> ' . htmlspecialchars(bv_notify_money_format($sellerRequestedAmount, $currency), ENT_QUOTES, 'UTF-8') . '</li>',
+            '<li><strong>Approved Amount:</strong> ' . htmlspecialchars(bv_notify_money_format($sellerApprovedAmount, $currency), ENT_QUOTES, 'UTF-8') . '</li>',
+            '<li><strong>Fee Deducted:</strong> ' . htmlspecialchars(bv_notify_money_format($sellerFeeLoss, $currency), ENT_QUOTES, 'UTF-8') . '</li>',
+            '<li><strong>Actual Refund:</strong> ' . htmlspecialchars(bv_notify_money_format($sellerActualRefund, $currency), ENT_QUOTES, 'UTF-8') . '</li>',
+        ];
+
+        $rowsHtml = '';
+        $textItems = [];
+        foreach ($normalizedItems as $line) {
+            $rowsHtml .= '<tr>'
+                . '<td style="padding:8px;border:1px solid #e5e7eb;">' . htmlspecialchars($line['listing_title'], ENT_QUOTES, 'UTF-8') . '</td>'
+                . '<td style="padding:8px;border:1px solid #e5e7eb;text-align:right;">' . htmlspecialchars(bv_notify_money_format($line['requested_amount'], $currency), ENT_QUOTES, 'UTF-8') . '</td>'
+                . '<td style="padding:8px;border:1px solid #e5e7eb;text-align:right;">' . htmlspecialchars(bv_notify_money_format($line['approved_amount'], $currency), ENT_QUOTES, 'UTF-8') . '</td>'
+                . '<td style="padding:8px;border:1px solid #e5e7eb;text-align:right;">' . htmlspecialchars(bv_notify_money_format($line['fee_loss'], $currency), ENT_QUOTES, 'UTF-8') . '</td>'
+                . '<td style="padding:8px;border:1px solid #e5e7eb;text-align:right;">' . htmlspecialchars(bv_notify_money_format($line['actual_refund'], $currency), ENT_QUOTES, 'UTF-8') . '</td>'
+                . '</tr>';
+
+            $textItems[] = '- ' . $line['listing_title']
+                . ' | Requested: ' . bv_notify_money_format($line['requested_amount'], $currency)
+                . ' | Approved: ' . bv_notify_money_format($line['approved_amount'], $currency)
+                . ' | Fee Loss: ' . bv_notify_money_format($line['fee_loss'], $currency)
+                . ' | Actual/Net: ' . bv_notify_money_format($line['actual_refund'], $currency);
+        }
+
+        $html = ''
+            . '<div style="font-family:Arial,sans-serif;font-size:14px;color:#111827;">'
+            . '<p>Refund #' . htmlspecialchars((string)$refundCode, ENT_QUOTES, 'UTF-8') . ' update for your seller-owned items.</p>'
+            . '<p><strong>Status:</strong> ' . htmlspecialchars($status, ENT_QUOTES, 'UTF-8') . '</p>'
+            . '<h3 style="margin:16px 0 8px;">Seller Refund Summary</h3>'
+            . '<ul style="margin:0 0 16px 20px;padding:0;">' . implode('', $summaryLinesHtml) . '</ul>'
+            . '<h3 style="margin:16px 0 8px;">Item Breakdown</h3>'
+            . '<table style="border-collapse:collapse;width:100%;font-size:13px;">'
+            . '<thead><tr>'
+            . '<th style="padding:8px;border:1px solid #e5e7eb;text-align:left;">Listing Title</th>'
+            . '<th style="padding:8px;border:1px solid #e5e7eb;text-align:right;">Requested</th>'
+            . '<th style="padding:8px;border:1px solid #e5e7eb;text-align:right;">Approved</th>'
+            . '<th style="padding:8px;border:1px solid #e5e7eb;text-align:right;">Fee Loss</th>'
+            . '<th style="padding:8px;border:1px solid #e5e7eb;text-align:right;">Actual / Net Refund</th>'
+            . '</tr></thead><tbody>' . $rowsHtml . '</tbody></table>'
+            . '</div>';
+
+        $text = "Refund #{$refundCode} update for your seller-owned items.
+"
+            . 'Status: ' . $status . "
+
+"
+            . "Seller Refund Summary
+"
+            . 'Requested Amount: ' . bv_notify_money_format($sellerRequestedAmount, $currency) . "
+"
+            . 'Approved Amount: ' . bv_notify_money_format($sellerApprovedAmount, $currency) . "
+"
+            . 'Fee Deducted: ' . bv_notify_money_format($sellerFeeLoss, $currency) . "
+"
+            . 'Actual Refund: ' . bv_notify_money_format($sellerActualRefund, $currency) . "
+
+"
+            . "Item Breakdown
+"
+            . implode("
+", $textItems);
+
+        return [
+            'subject' => $subject,
+            'html' => $html,
+            'text' => $text,
+        ];
+    }
+}
+
+if (!function_exists('bv_notify_apply_refund_seller_template_override')) {
+    function bv_notify_apply_refund_seller_template_override(string $eventKey, string $recipientType, array $context, array $recipient, array $template): array
+    {
+        if (!in_array($eventKey, ['refund.request.created', 'refund.completed'], true)) {
+            return $template;
+        }
+
+        if (strtolower(trim($recipientType)) !== 'seller') {
+            return $template;
+        }
+
+        $refundId = (int)($context['refund_id'] ?? 0);
+        $sellerId = (int)($recipient['seller_id'] ?? ($recipient['id'] ?? ($context['seller_id'] ?? 0)));
+
+        $sellerTemplate = bv_notify_build_seller_refund_email_payload($eventKey, $refundId, $sellerId);
+        if (!is_array($sellerTemplate) || $sellerTemplate === []) {
+            return $template;
+        }
+
+        return [
+            'subject' => (string)($sellerTemplate['subject'] ?? ($template['subject'] ?? '')),
+            'html' => (string)($sellerTemplate['html'] ?? ($template['html'] ?? '')),
+            'text' => (string)($sellerTemplate['text'] ?? ($template['text'] ?? '')),
+        ];
+    }
+}
+
 if (!function_exists('bv_notify')) {
     function bv_notify(string $eventKey, array $context = [], array $options = []): array
     {
